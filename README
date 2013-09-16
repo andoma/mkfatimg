@@ -1,0 +1,6 @@
+Small tool for building a SD image with one primary FAT parition
+filled in and then fill this partition with files from a directory.
+
+Main purpose is to do this easially without having to be root.
+
+Created for, and only tested with, Raspberry Pi

@@ -54,8 +54,19 @@ static uint8_t bootsector[512] = {
 static void
 usage(const char *argv0)
 {
-  fprintf(stderr, "RTFS\n");
-  exit(0);
+  printf("Usage:  %s [OPTIONS]\n", argv0);
+  printf("\nMandatory options:\n\n");
+  printf("  -s SIZE         Size of FAT filesystem in sectors (512 bytes)\n");
+  printf("  -f PATH         Path to files that should be coped\n");
+  printf("  -o PATH         Path to output file (will be created)\n");
+  printf("\nOptional options:\n\n");
+  printf("  -b PATH         Path to bootloader to install (max 448 bytes)\n");
+  printf("  -k PATH         Path to kernel to install\n");
+  printf("  -t SECTORS      Image total size in sectors\n");
+  printf("  -T GIGABYTES    Image total size in 1024*1024*1024 bytes\n");
+  printf("  -n              Keep temporary filesystem image\n");
+  printf("\n");
+  exit(1);
 }
 
 static char tmpname[PATH_MAX];
@@ -76,16 +87,19 @@ int
 main(int argc, char **argv)
 {
   int opt;
-  unsigned int size = 524288;
+  unsigned int fs_size = 524288;
   const char *sourcedir = NULL;
   int no_remove_tmp_file = 0;
   const char *output = NULL;
+  const char *bootloaderpath = NULL;
+  const char *kernelpath = NULL;
+  int totalsize = 0;
 
-  while((opt = getopt(argc, argv, "s:f:no:")) != -1) {
+  while((opt = getopt(argc, argv, "s:f:no:b:k:t:T:")) != -1) {
 
     switch(opt) {
     case 's':
-      size = atoi(optarg);
+      fs_size = atoi(optarg);
       break;
     case 'f':
       sourcedir = optarg;
@@ -96,10 +110,22 @@ main(int argc, char **argv)
     case 'n':
       no_remove_tmp_file = 1;
       break;
+    case 'b':
+      bootloaderpath = optarg;
+      break;
+    case 'k':
+      kernelpath = optarg;
+      break;
+    case 't':
+      totalsize = atoi(optarg) * 512;
+      break;
+    case 'T':
+      totalsize = atoi(optarg) * 1024LL * 1024LL * 1024LL;
+      break;
     }
   }
 
-  if(size < 1024 || !sourcedir || !output)
+  if(fs_size < 1024 || !sourcedir || !output)
     usage(argv[0]);
 
 
@@ -113,12 +139,12 @@ main(int argc, char **argv)
   if(!no_remove_tmp_file)
     atexit(cleanup_tmpfile);
 
-  if(ftruncate(fd, size * 512)) {
+  if(ftruncate(fd, fs_size * 512)) {
     perror("ftruncate");
     exit(1);
   }
   close(fd);
-  
+
   char tmpbuf[1024];
 
   snprintf(tmpbuf, sizeof(tmpbuf), "/sbin/mkfs.vfat -F 16 -v %s", tmpname);
@@ -128,7 +154,6 @@ main(int argc, char **argv)
 
   printf("\n");
   printf("Mounting file system at %s\n", tmpname);
-  
 
   DRIVE *d = fat_open_image(tmpname, 1);
   if(d == NULL) {
@@ -204,7 +229,47 @@ main(int argc, char **argv)
 
   fat_drive_close(d);
 
-  unlink(output);
+  if(bootloaderpath != NULL) {
+    const int blfd = open(bootloaderpath, O_RDONLY);
+    if(blfd == -1) {
+      perror("Unable to open bootloader");
+      exit(1);
+    }
+
+    int r = read(blfd, bootsector, 0x1c0);
+    if(r < 0) {
+      perror("Unable to read bootloader");
+      exit(1);
+    }
+
+    close(blfd);
+    printf("Loaded bootloader from %s (%d bytes)\n", bootloaderpath, r);
+  }
+
+  void *kernel = NULL;
+  size_t kernel_size = 0;
+  if(kernelpath != NULL) {
+    const int kfd = open(kernelpath, O_RDONLY);
+    if(kfd == -1) {
+      perror("Unable to open kernel");
+      exit(1);
+    }
+
+    struct stat st;
+    if(fstat(kfd, &st)) {
+      perror("Unable to stat kernel");
+      exit(1);
+    }
+
+    kernel_size = st.st_size;
+    kernel = malloc(st.st_size);
+
+    if(read(kfd, kernel, kernel_size) != kernel_size) {
+      perror("Unable to read kernel");
+      exit(1);
+    }
+    close(kfd);
+  }
 
   int fatfd = open(tmpname, O_RDONLY);
   if(fatfd == -1) {
@@ -212,11 +277,43 @@ main(int argc, char **argv)
     exit(1);
   }
 
+  size_t imgbytes = fs_size * 512;
+  void *imgmem = malloc(imgbytes);
+  if(read(fatfd, imgmem, imgbytes) != imgbytes) {
+    perror("Unable to read image to RAM");
+    goto bad;
+  }
+
+  unlink(output);
+
   int outfd = open(output, O_CREAT | O_WRONLY, 0666);
   if(outfd == -1) {
     perror("Uanble to open output file");
     exit(1);
   }
+
+  unsigned int fs_start = 1;
+
+
+  if(kernel != NULL) {
+    int kernel_start = 2048;
+    int kernel_sectors = (kernel_size + 511) / 512;
+
+    if(pwrite(outfd, kernel, kernel_size, kernel_start * 512) !=
+       kernel_size) {
+      perror("Uanble to write kernel");
+      exit(1);
+    }
+
+    printf("Kernel start at sector %d\n", kernel_start);
+    printf("Kernel size in sectors: %d\n", kernel_sectors);
+    fs_start = kernel_start + kernel_sectors;
+  }
+
+  // Round fs_start to 8192 sector alignment (4MB)
+  fs_start = (fs_start + 8191) & ~8191;
+
+  printf("Filesystem start at sector %d\n", fs_start);
 
   unsigned char *x = bootsector + 0x1c0;
 
@@ -227,39 +324,33 @@ main(int argc, char **argv)
   *x++ = 0xe0;
   *x++ = 0xff;
 
+  // Start sector
 
-  // Start sector (8192)
-
-  *x++ = 0x00;
-  *x++ = 0x20;
-  *x++ = 0x00;
-  *x++ = 0x00;
+  *x++ = fs_start;
+  *x++ = fs_start >> 8;
+  *x++ = fs_start >> 16;
+  *x++ = fs_start >> 24;
 
   // Size
 
-  *x++ = size;
-  *x++ = size >> 8;
-  *x++ = size >> 16;
-  *x++ = size >> 24;
+  *x++ = fs_size;
+  *x++ = fs_size >> 8;
+  *x++ = fs_size >> 16;
+  *x++ = fs_size >> 24;
 
-  if(write(outfd, bootsector, 512) != 512) {
+
+  if(pwrite(outfd, imgmem, imgbytes, 512 * fs_start) != imgbytes) {
+    perror("Unable to write to output file");
+    goto bad;
+  }
+
+  if(pwrite(outfd, bootsector, 512, 0) != 512) {
     perror("Unable to write bootsector to output file");
     goto bad;
   }
 
-  lseek(outfd, 512 * 8192, SEEK_SET);
-  
-  size_t imgbytes = size * 512;
-
-  void *imgmem = malloc(imgbytes);
-  if(read(fatfd, imgmem, imgbytes) != imgbytes) {
-    perror("Unable to read image to RAM");
-    goto bad;
-  }
-
-  if(write(outfd, imgmem, imgbytes) != imgbytes) {
-    perror("Unable to write to output file");
-    goto bad;
+  if(totalsize) {
+    ftruncate(outfd, totalsize);
   }
 
   close(outfd);

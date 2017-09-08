@@ -182,7 +182,7 @@ main(int argc, char **argv)
     snprintf(path, sizeof(path), "%s/%s", sourcedir, fn);
 
 
-    printf("Copying %-15s ... ", fn);
+    printf("Copying %-40s ... ", fn);
     fflush(stdout);
 
     int src = open(path, O_RDONLY);
@@ -220,9 +220,7 @@ main(int argc, char **argv)
 
     free(mem);
 
-    printf("written ... ");
     fflush(stdout);
-
     fclose(dst);
     printf("OK\n");
   }
@@ -296,7 +294,7 @@ main(int argc, char **argv)
 
 
   if(kernel != NULL) {
-    int kernel_start = 2048;
+    int kernel_start = 1;
     int kernel_sectors = (kernel_size + 511) / 512;
 
     if(pwrite(outfd, kernel, kernel_size, kernel_start * 512) !=
@@ -350,7 +348,8 @@ main(int argc, char **argv)
   }
 
   if(totalsize) {
-    ftruncate(outfd, totalsize);
+    if(ftruncate(outfd, totalsize) < 0)
+      perror("ftruncate");
   }
 
   close(outfd);
